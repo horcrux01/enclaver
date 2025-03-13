@@ -8,7 +8,7 @@ case $local_arch in
 		rust_target="x86_64-unknown-linux-musl"
 		;;
 	aarch64)
-		rust_target="aarch64-unknown-linux-musl"
+		rust_target="aarch64-unknown-linux-gnu"
 		;;
 	*)
 		echo "Unsupported architecture: $local_arch"
