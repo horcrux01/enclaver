@@ -20,7 +20,7 @@ use tokio_vsock::VsockStream;
 use crate::policy::EgressPolicy;
 
 #[async_trait]
-trait JsonTransport: Sized + Sync {
+pub trait JsonTransport: Sized + Sync {
     async fn send<W: AsyncWrite + Unpin + Send>(&self, w: &mut W) -> anyhow::Result<()>;
     async fn recv<R: AsyncRead + Unpin + Send>(r: &mut R) -> anyhow::Result<Self>;
 }

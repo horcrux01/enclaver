@@ -748,8 +748,10 @@ checksum = "7e36cc9d416881d2e24f9a963be5fb1cd90966419ac844274161d10488b3e825"
 dependencies = [
  "android-tzdata",
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-targets 0.52.6",
 ]
 
@@ -993,6 +995,7 @@ dependencies = [
  "bollard",
  "bytes",
  "cbc",
+ "chrono",
  "circbuf",
  "clap",
  "console-subscriber",
@@ -1007,6 +1010,7 @@ dependencies = [
  "ipnetwork",
  "json",
  "lazy_static",
+ "libc",
  "log",
  "nix 0.24.3",
  "pkcs8",
@@ -1015,6 +1019,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rsa",
+ "rsntp",
  "rtnetlink",
  "rustls 0.21.12",
  "rustls-pemfile 1.0.4",
@@ -1820,9 +1825,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.170"
+version = "0.2.172"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "875b3680cb2f8f71bdcf9a30f38d48282f5d3c95cbf9b3fa57269bb5d5c06828"
+checksum = "d750af042f7ef4f724306de029d18836c26c1765a54a6a3f094cbd23a7267ffa"
 
 [[package]]
 name = "libm"
@@ -2520,6 +2525,16 @@ dependencies = [
  "smallvec",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rsntp"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5cce5f45764fc4f0da82badc165fec123f137f2b2ba7112778a83575bc6af3e1"
+dependencies = [
+ "chrono",
+ "tokio",
 ]
 
 [[package]]

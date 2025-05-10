@@ -1,6 +1,6 @@
 use crate::constants::{
     APP_LOG_PORT, EIF_FILE_NAME, HTTP_EGRESS_VSOCK_PORT, MANIFEST_FILE_NAME, RELEASE_BUNDLE_DIR,
-    STATUS_PORT,
+    STATUS_PORT, TIME_VSOCK_PORT,
 };
 use crate::manifest::{load_manifest, Defaults, Manifest};
 use crate::utils;
@@ -18,6 +18,7 @@ use tokio_vsock::VsockStream;
 use crate::nitro_cli::{EnclaveInfo, NitroCLI, RunEnclaveArgs};
 use crate::proxy::egress_http::HostHttpProxy;
 use crate::proxy::ingress::HostProxy;
+use crate::proxy::time::HostTime;
 
 const LOG_VSOCK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_VSOCK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
@@ -122,6 +123,7 @@ impl Enclave {
         // Start the egress proxy before starting the enclave, to avoid (unlikely) race conditions
         // where something inside the enclave attempts egress before the proxy is ready.
         self.start_egress_proxy().await?;
+        self.start_time().await?;
 
         info!("starting enclave");
         let enclave_info = self
@@ -192,6 +194,16 @@ impl Enclave {
                 proxy.serve(cid, listen_port.into()).await;
             })?)
         }
+
+        Ok(())
+    }
+
+    async fn start_time(&mut self) -> Result<()> {
+        info!("starting host time service on vsock port {TIME_VSOCK_PORT}");
+        let time = HostTime::bind(TIME_VSOCK_PORT)?;
+        self.tasks.push(utils::spawn!("time", async move {
+            time.serve().await;
+        })?);
 
         Ok(())
     }

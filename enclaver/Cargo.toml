@@ -72,6 +72,9 @@ aes = "0.8"
 sha2 = "0.10"
 ignore-result = "0.2.0"
 console-subscriber = { version = "0.1.10", optional = true }
+rsntp = "4.0.0"
+libc = "0.2.172"
+chrono = { version = "0.4.31", features = [ "serde" ] }
 
 [dev-dependencies]
 assert2 = "0.3"

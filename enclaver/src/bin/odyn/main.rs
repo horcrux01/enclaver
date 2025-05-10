@@ -8,6 +8,7 @@ pub mod enclave;
 pub mod ingress;
 pub mod kms_proxy;
 pub mod launcher;
+pub mod time;
 
 use anyhow::Result;
 use clap::Parser;
@@ -24,6 +25,7 @@ use console::{AppLog, AppStatus};
 use egress::EgressService;
 use ingress::IngressService;
 use kms_proxy::KmsProxyService;
+use time::TimeService;
 
 #[derive(Parser)]
 struct CliArgs {
@@ -57,6 +59,7 @@ async fn launch(args: &CliArgs) -> Result<launcher::ExitStatus> {
     let ingress = IngressService::start(&config)?;
     let kms_proxy = KmsProxyService::start(config.clone(), nsm.clone()).await?;
     let api = ApiService::start(&config, nsm.clone())?;
+    let time = TimeService::start(&config).await?;
 
     let creds = launcher::Credentials { uid: 0, gid: 0 };
 
@@ -64,6 +67,7 @@ async fn launch(args: &CliArgs) -> Result<launcher::ExitStatus> {
     let exit_status = launcher::start_child(args.entrypoint.clone(), creds).await??;
     info!("Entrypoint {}", exit_status);
 
+    time.stop().await;
     api.stop().await;
     kms_proxy.stop().await;
     ingress.stop().await;
