@@ -58,8 +58,8 @@ async fn launch(args: &CliArgs) -> Result<launcher::ExitStatus> {
     let egress = EgressService::start(&config).await?;
     let ingress = IngressService::start(&config)?;
     let kms_proxy = KmsProxyService::start(config.clone(), nsm.clone()).await?;
-    let api = ApiService::start(&config, nsm.clone())?;
     let time = TimeService::start(&config).await?;
+    let api = ApiService::start(&config, nsm.clone()).await?;
 
     let creds = launcher::Credentials { uid: 0, gid: 0 };
 
