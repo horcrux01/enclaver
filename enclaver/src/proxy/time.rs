@@ -60,7 +60,8 @@ impl HostTime {
         use rsntp::AsyncSntpClient;
         let client = AsyncSntpClient::new();
         info!("Querying time in host");
-        let resp = match client.synchronize("time.aws.com").await {
+        // The Amazon Time Sync Service, link-local on every EC2 instance.
+        let resp = match client.synchronize("169.254.169.123").await {
             Ok(result) => match result.datetime().into_chrono_datetime() {
                 Ok(date) => TimeResponse::Ok(date),
                 Err(e) => TimeResponse::Err(format!("Failed to convert response: {:?}", e)),

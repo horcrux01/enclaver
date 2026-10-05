@@ -38,4 +38,24 @@ jobs:
         run: |
           cargo clippy --quiet --no-deps --manifest-path enclaver/Cargo.toml --features=run_enclave,odyn,tracing
 
-  ## TODO: Add test job here?
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse MSRV
+        run: sed -n 's/^rust-version = "\(.*\)"$/RUSTUP_TOOLCHAIN=\1/p' enclaver/Cargo.toml >> "$GITHUB_ENV"
+      - name: Install Rust Toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN"
+
+      # The skipped tests open AF_VSOCK sockets, which a container refuses
+      # with EPERM.
+      - name: Test all binaries
+        run: >-
+          cargo test --locked --manifest-path enclaver/Cargo.toml --features=run_enclave,odyn --
+          --skip proxy::egress_http::tests::test_http_proxy
+          --skip proxy::egress_http::tests::test_https_proxy
+          --skip proxy::ingress::tests::test_enclave_proxy
+          --skip proxy::ingress::tests::test_full_proxy
+          --skip console::tests::test_app_status

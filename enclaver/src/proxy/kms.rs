@@ -1,13 +1,13 @@
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Error, Result};
 use async_trait::async_trait;
-use aws_config::SdkConfig;
-use aws_credential_types::provider::ProvideCredentials;
+use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{SignableBody, SignableRequest, SigningSettings};
 use aws_sigv4::sign::v4::SigningParams;
+use aws_smithy_runtime::expiring_cache::ExpiringCache;
 use aws_smithy_runtime_api::client::identity::Identity;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
@@ -16,7 +16,8 @@ use hyper::http::uri::{Authority, Scheme};
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use json::{object, JsonValue};
 use lazy_static::lazy_static;
-use log::{debug, trace};
+use aws_smithy_types::error::display::DisplayErrorContext;
+use log::{debug, trace, warn};
 use regex::Regex;
 
 use crate::http_util::HttpHandler;
@@ -239,14 +240,116 @@ pub trait KmsEndpointProvider {
     fn endpoint(&self, region: &str) -> String;
 }
 
-pub enum CredentialsGetter {
-    Credentials(Credentials),
-    SdkConfig(SdkConfig),
+/// How long before their expiry cached credentials are replaced. EC2 offers
+/// the rotated set at least 5 minutes before the old one expires, so a
+/// refresh this late gets the new set while this clock is at most a minute
+/// ahead.
+const CREDENTIALS_REFRESH_BEFORE: Duration = Duration::from_secs(240);
+
+/// How long a refresh that brought no set beyond `CREDENTIALS_REFRESH_BEFORE`,
+/// or none at all, holds off the next one.
+const CREDENTIALS_RETRY_AFTER: Duration = Duration::from_secs(20);
+
+/// How long a refresh may take before the cache stops waiting for it.
+const CREDENTIALS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The cache holds no credentials that have not expired.
+#[derive(Debug)]
+pub struct CredentialsUnavailable(String);
+
+impl std::fmt::Display for CredentialsUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no unexpired instance-role credentials: {}", self.0)
+    }
+}
+
+impl std::error::Error for CredentialsUnavailable {}
+
+/// Credentials from `provider`, fetched again only once the cached set is
+/// within `CREDENTIALS_REFRESH_BEFORE` of its expiry; concurrent callers
+/// share one fetch. A fetch that yields no set beyond that margin (the IMDS
+/// provider hands back its last set when IMDS fails) keeps the newest set
+/// that is still valid for `CREDENTIALS_RETRY_AFTER`, and fails once none is.
+/// A set without an expiry is not cached.
+pub struct CredentialsCache {
+    provider: SharedCredentialsProvider,
+    cache: ExpiringCache<Credentials, Error>,
+    refresh_timeout: Duration,
+    /// The newest set with an expiry, and when a failed refresh may be retried.
+    last: Mutex<(Option<Credentials>, Option<SystemTime>)>,
+}
+
+impl CredentialsCache {
+    pub fn new(provider: SharedCredentialsProvider) -> Self {
+        Self::with_timeout(provider, CREDENTIALS_REFRESH_TIMEOUT)
+    }
+
+    fn with_timeout(provider: SharedCredentialsProvider, refresh_timeout: Duration) -> Self {
+        Self {
+            provider,
+            cache: ExpiringCache::new(CREDENTIALS_REFRESH_BEFORE),
+            refresh_timeout,
+            last: Mutex::new((None, None)),
+        }
+    }
+
+    pub async fn get(&self) -> Result<Credentials> {
+        self.get_at(SystemTime::now()).await
+    }
+
+    async fn get_at(&self, now: SystemTime) -> Result<Credentials> {
+        if let Some(creds) = self.cache.yield_or_clear_if_expired(now).await {
+            return Ok(creds);
+        }
+        self.cache.get_or_load(|| self.load(now)).await
+    }
+
+    /// The set to cache and the time `ExpiringCache` should take as its expiry.
+    async fn load(&self, now: SystemTime) -> Result<(Credentials, SystemTime)> {
+        if let (_, Some(retry_at)) = *self.last.lock().unwrap() {
+            if now < retry_at {
+                return Err(CredentialsUnavailable(format!("next refresh at {retry_at:?}")).into());
+            }
+        }
+        let started = Instant::now();
+        let fetched = tokio::time::timeout(self.refresh_timeout, self.provider.provide_credentials()).await;
+        let now = now + started.elapsed();
+        let fetched = match fetched {
+            Ok(Ok(creds)) => match creds.expiry() {
+                None => return Ok((creds, now)),
+                Some(expiry) if expiry > now + CREDENTIALS_REFRESH_BEFORE => {
+                    *self.last.lock().unwrap() = (Some(creds.clone()), None);
+                    return Ok((creds, expiry));
+                }
+                Some(_) => Some(creds),
+            },
+            Ok(Err(err)) => {
+                warn!("Refreshing the KMS proxy's credentials failed: {}", DisplayErrorContext(&err));
+                None
+            }
+            Err(_) => {
+                warn!("Refreshing the KMS proxy's credentials took over {:?}", self.refresh_timeout);
+                None
+            }
+        };
+        let mut last = self.last.lock().unwrap();
+        let retry_at = now + CREDENTIALS_RETRY_AFTER;
+        last.1 = Some(retry_at);
+        let newest = [fetched, last.0.take()].into_iter().flatten().max_by_key(|c| c.expiry());
+        last.0 = newest.clone();
+        match newest.and_then(|c| c.expiry().filter(|e| *e > now).map(|e| (c, e))) {
+            Some((creds, expiry)) => {
+                warn!("No credentials valid beyond {CREDENTIALS_REFRESH_BEFORE:?}; serving a set expiring at {expiry:?} until {retry_at:?}");
+                Ok((creds, expiry.min(retry_at) + CREDENTIALS_REFRESH_BEFORE))
+            }
+            None => Err(CredentialsUnavailable(format!("next refresh at {retry_at:?}")).into()),
+        }
+    }
 }
 
 pub struct KmsProxyConfig {
     pub client: Box<dyn HttpClient + Send + Sync>,
-    pub credentials_get: CredentialsGetter,
+    pub credentials: CredentialsCache,
     pub keypair: Arc<KeyPair>,
     pub attester: Box<dyn AttestationProvider + Send + Sync>,
     pub endpoints: Arc<dyn KmsEndpointProvider + Send + Sync>,
@@ -258,14 +361,7 @@ impl KmsProxyConfig {
         Authority::from_maybe_shared(endpoint).unwrap()
     }
     pub async fn credentials(&self) -> Result<Credentials> {
-        match &self.credentials_get {
-            CredentialsGetter::Credentials(c) => Ok(c.clone()),
-            CredentialsGetter::SdkConfig(sdk_config) => Ok(sdk_config
-                .credentials_provider()
-                .ok_or(anyhow!("credentials provider is missing"))?
-                .provide_credentials()
-                .await?),
-        }
+        self.credentials.get().await
     }
 }
 
@@ -391,10 +487,22 @@ impl HttpHandler for KmsProxyHandler {
 
         // TODO: Check the signature!!!
 
-        if req_in.is_attesting_action() {
+        let resp = if req_in.is_attesting_action() {
             self.handle_attesting_action(req_in).await
         } else {
             self.handle_forward(req_in).await
+        };
+        match resp {
+            // An error from a handler drops the connection; this one is the
+            // caller's to read.
+            Err(err) if err.is::<CredentialsUnavailable>() => Ok(Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header(hyper::header::CONTENT_TYPE, &X_AMZ_JSON)
+                .body(json_body(object! {
+                    "__type": "CredentialsUnavailable",
+                    "message": err.to_string(),
+                }))?),
+            resp => resp,
         }
     }
 }
@@ -455,6 +563,11 @@ mod tests {
     use super::*;
     use crate::nsm::StaticAttestationProvider;
     use assert2::assert;
+    use aws_credential_types::provider::error::CredentialsError;
+    use aws_credential_types::provider::future;
+    use std::collections::VecDeque;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering::SeqCst;
     use pkcs8::DecodePrivateKey;
     use rsa::RsaPrivateKey;
 
@@ -559,22 +672,170 @@ mod tests {
     }
 
     fn new_test_handler() -> KmsProxyHandler {
+        test_handler(CredentialsCache::new(SharedCredentialsProvider::new(
+            Credentials::from_keys("TESTKEY", "TESTSECRET", None),
+        )))
+    }
+
+    fn test_handler(credentials: CredentialsCache) -> KmsProxyHandler {
         let key_der = base64::decode(crate::proxy::pkcs7::tests::PRIVATE_KEY).unwrap();
         let priv_key = RsaPrivateKey::from_pkcs8_der(&key_der).unwrap();
 
         let config = KmsProxyConfig {
             client: Box::new(Mock),
-            credentials_get: CredentialsGetter::Credentials(Credentials::from_keys(
-                "TESTKEY",
-                "TESTSECRET",
-                None,
-            )),
+            credentials,
             keypair: Arc::new(KeyPair::from_private(priv_key)),
             attester: Box::new(StaticAttestationProvider::new(ATTESTATION_DOC.to_vec())),
             endpoints: Arc::new(Mock {}),
         };
 
         KmsProxyHandler { config }
+    }
+
+    /// What `ImdsCredentialsProvider` does: each fetch yields the next scripted
+    /// outcome, `Some(expiry)` for a new set or `None` for a failure, which
+    /// takes `delay` and yields the last set fetched (or an error before any).
+    /// The script runs out into failures.
+    #[derive(Debug)]
+    struct ImdsLike {
+        loads: Arc<AtomicUsize>,
+        script: Mutex<VecDeque<Option<Option<SystemTime>>>>,
+        last: Mutex<Option<Credentials>>,
+        delay: Duration,
+    }
+
+    impl ProvideCredentials for ImdsLike {
+        fn provide_credentials<'a>(&'a self) -> future::ProvideCredentials<'a>
+        where
+            Self: 'a,
+        {
+            future::ProvideCredentials::new(async move {
+                let n = self.loads.fetch_add(1, SeqCst);
+                let next = self.script.lock().unwrap().pop_front();
+                if !matches!(next, Some(Some(_))) {
+                    tokio::time::sleep(self.delay).await;
+                }
+                let mut last = self.last.lock().unwrap();
+                match next {
+                    Some(Some(expiry)) => {
+                        let creds = Credentials::new(format!("AKID{n}"), "secret", None, expiry, "test");
+                        *last = Some(creds.clone());
+                        Ok(creds)
+                    }
+                    Some(None) | None => last.clone().ok_or_else(|| CredentialsError::not_loaded("IMDS is down")),
+                }
+            })
+        }
+    }
+
+    const T0: SystemTime = SystemTime::UNIX_EPOCH;
+    const LIFETIME: Duration = Duration::from_secs(6 * 3600);
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    /// A cache over `ImdsLike` with `script`; returns it and its load count.
+    fn imds_cache(
+        script: &[Option<Option<SystemTime>>],
+        delay: Duration,
+        timeout: Duration,
+    ) -> (CredentialsCache, Arc<AtomicUsize>) {
+        let loads = Arc::new(AtomicUsize::new(0));
+        let provider = ImdsLike {
+            loads: loads.clone(),
+            script: Mutex::new(script.iter().cloned().collect()),
+            last: Mutex::new(None),
+            delay,
+        };
+        let cache = CredentialsCache::with_timeout(SharedCredentialsProvider::new(provider), timeout);
+        (cache, loads)
+    }
+
+    #[tokio::test]
+    async fn credentials_are_reused_until_the_refresh_window() {
+        let script = [Some(Some(T0 + LIFETIME)), Some(Some(T0 + LIFETIME * 2))];
+        let (cache, loads) = imds_cache(&script, Duration::ZERO, secs(5));
+        for _ in 0..3 {
+            cache.get_at(T0).await.unwrap();
+        }
+        assert!(loads.load(SeqCst) == 1);
+        cache.get_at(T0 + LIFETIME - CREDENTIALS_REFRESH_BEFORE - secs(10)).await.unwrap();
+        assert!(loads.load(SeqCst) == 1, "a set outside the refresh window was reloaded");
+        let creds = cache.get_at(T0 + LIFETIME - CREDENTIALS_REFRESH_BEFORE + secs(10)).await.unwrap();
+        assert!(loads.load(SeqCst) == 2, "a set inside the refresh window was not reloaded");
+        assert!(creds.access_key_id() == "AKID1");
+    }
+
+    /// IMDS down inside the refresh window: the provider hands back the old
+    /// set. Concurrent callers share one fetch, keep the old set, and the next
+    /// fetch waits `CREDENTIALS_RETRY_AFTER`.
+    #[tokio::test]
+    async fn a_stale_refresh_serves_the_valid_set_and_backs_off() {
+        let (cache, loads) = imds_cache(&[Some(Some(T0 + LIFETIME))], Duration::from_millis(50), secs(5));
+        let cache = Arc::new(cache);
+        cache.get_at(T0).await.unwrap();
+        let t = T0 + LIFETIME - CREDENTIALS_REFRESH_BEFORE + secs(10);
+        let started = Instant::now();
+        let calls: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = cache.clone();
+                tokio::spawn(async move { cache.get_at(t).await.unwrap() })
+            })
+            .collect();
+        for call in calls {
+            assert!(call.await.unwrap().access_key_id() == "AKID0");
+        }
+        assert!(loads.load(SeqCst) == 2, "eight callers refreshed {} times", loads.load(SeqCst) - 1);
+        assert!(started.elapsed() < Duration::from_millis(300), "callers queued: {:?}", started.elapsed());
+        cache.get_at(t + CREDENTIALS_RETRY_AFTER - secs(1)).await.unwrap();
+        assert!(loads.load(SeqCst) == 2, "refreshed again before CREDENTIALS_RETRY_AFTER");
+        cache.get_at(t + CREDENTIALS_RETRY_AFTER + secs(1)).await.unwrap();
+        assert!(loads.load(SeqCst) == 3, "never refreshed again");
+    }
+
+    /// A refresh that hangs is abandoned, and the valid set is served.
+    #[tokio::test]
+    async fn a_hung_refresh_serves_the_valid_set() {
+        let (cache, _) = imds_cache(&[Some(Some(T0 + LIFETIME))], Duration::from_millis(400), Duration::from_millis(50));
+        cache.get_at(T0).await.unwrap();
+        let started = Instant::now();
+        let creds = cache.get_at(T0 + LIFETIME - secs(60)).await.unwrap();
+        assert!(creds.access_key_id() == "AKID0");
+        assert!(started.elapsed() < Duration::from_millis(300), "waited {:?} on a hung refresh", started.elapsed());
+    }
+
+    /// Past the last set's expiry the cache fails, and without asking again
+    /// until `CREDENTIALS_RETRY_AFTER`.
+    #[tokio::test]
+    async fn an_expired_set_is_never_served() {
+        let (cache, loads) = imds_cache(&[Some(Some(T0 + LIFETIME))], Duration::ZERO, secs(5));
+        cache.get_at(T0).await.unwrap();
+        let err = cache.get_at(T0 + LIFETIME + secs(1)).await.expect_err("an expired set was served");
+        assert!(err.to_string().contains("no unexpired instance-role credentials"), "{err}");
+        assert!(loads.load(SeqCst) == 2);
+        cache.get_at(T0 + LIFETIME + secs(2)).await.expect_err("an expired set was served");
+        assert!(loads.load(SeqCst) == 2, "a failed refresh was retried at once");
+    }
+
+    #[tokio::test]
+    async fn credentials_without_an_expiry_are_not_cached() {
+        let (cache, loads) = imds_cache(&[Some(None), Some(None)], Duration::ZERO, secs(5));
+        cache.get_at(T0).await.unwrap();
+        cache.get_at(T0).await.unwrap();
+        assert!(loads.load(SeqCst) == 2);
+    }
+
+    /// The caller gets a KMS-shaped error, not a dropped connection.
+    #[tokio::test]
+    async fn no_credentials_is_a_503_naming_the_cause() {
+        let handler = test_handler(imds_cache(&[], Duration::ZERO, secs(5)).0);
+        let resp = handler.handle(kms_request("TrentService.ListKeys", object! {})).await.unwrap();
+        let (head, body) = resp.into_parts();
+        let body = body.collect().await.unwrap().to_bytes();
+        assert!(head.status == StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_as_json(body).await.unwrap();
+        assert!(body["message"].as_str().unwrap().contains("no unexpired instance-role credentials"));
     }
 
     #[test]

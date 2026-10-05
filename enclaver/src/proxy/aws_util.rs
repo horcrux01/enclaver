@@ -44,8 +44,13 @@ impl HttpConnector for ProxiedHttpClient {
     fn call(&self, request: Request) -> HttpConnectorFuture {
         let client = self.0.clone();
         let result = async move {
-            let request = request.try_into_http1x().unwrap();
-            let response = client.request(request).await.unwrap();
+            let request = request
+                .try_into_http1x()
+                .map_err(|err| ConnectorError::user(err.into()))?;
+            let response = client
+                .request(request)
+                .await
+                .map_err(|err| ConnectorError::io(err.into()))?;
             let (head, body) = response.into_parts();
             body.collect().await
                 .map_err(|err| ConnectorError::user(err.into()))
@@ -101,4 +106,25 @@ pub async fn load_config_from_imds(imds_client: imds::Client) -> Result<SdkConfi
         .build();
 
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A failed connection to the egress proxy is an error the SDK reports,
+    /// not a panic in the caller's task.
+    #[tokio::test]
+    async fn a_failed_connection_is_an_error() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy: Uri = format!("http://{}", closed.local_addr().unwrap()).parse().unwrap();
+        drop(closed);
+        let request = http::Request::builder()
+            .uri(IMDS_URL)
+            .body(SdkBody::empty())
+            .unwrap();
+        let call = ProxiedHttpClient::new(proxy).call(Request::try_from(request).unwrap());
+        let result = tokio::spawn(call).await.expect("the call panicked");
+        assert!(result.is_err(), "a refused connection succeeded");
+    }
 }
