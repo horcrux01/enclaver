@@ -9,7 +9,7 @@ use enclaver::http_util::HttpServer;
 use enclaver::keypair::KeyPair;
 use enclaver::nsm::{Nsm, NsmAttestationProvider};
 use enclaver::proxy::aws_util;
-use enclaver::proxy::kms::{KmsProxyConfig, KmsProxyHandler, CredentialsGetter};
+use enclaver::proxy::kms::{CredentialsCache, KmsProxyConfig, KmsProxyHandler};
 
 use crate::config::Configuration;
 
@@ -37,7 +37,11 @@ impl KmsProxyService {
 
                 let client = Box::new(enclaver::http_client::new_http_proxy_client(proxy_uri));
                 let kms_config = KmsProxyConfig {
-                    credentials_get: CredentialsGetter::SdkConfig(sdk_config),
+                    credentials: CredentialsCache::new(
+                        sdk_config
+                            .credentials_provider()
+                            .ok_or_else(|| anyhow!("credentials provider is missing"))?,
+                    ),
                     client,
                     keypair,
                     attester,
