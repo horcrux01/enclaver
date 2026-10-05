@@ -1,6 +1,12 @@
 name: CI
 
-on: [push, pull_request]
+on:
+  # A bare `push:` also fires for a PR's branch, running CI twice per PR; a PR's
+  # pushes are covered by `pull_request`.
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
